@@ -13,6 +13,18 @@ DIFY_API_KEY = os.environ.get("DIFY_API_KEY")
 
 conversations = {}
 
+# =============================================
+# НОВОЕ: Защита от спама
+# =============================================
+# Хранит время последнего сообщения каждого юзера
+last_message_time = {}
+# Хранит флаг "сейчас обрабатываю" для каждого юзера
+processing = {}
+# Минимальная пауза между сообщениями (в секундах)
+MIN_DELAY = 2
+# Лок для потокобезопасности
+spam_lock = threading.Lock()
+
 
 # =============================================
 # Отправка сообщения в Telegram
@@ -104,10 +116,9 @@ def send_typing_action(chat_id):
 
 
 # =============================================
-# ДИНАМИЧЕСКИЙ ТАЙМЕР С РАНДОМОМ И ФРАЗАМИ
+# Динамический таймер с рандомом и фразами
 # =============================================
 def update_timer(chat_id, message_id, stop_event):
-    # Разные фразы чтобы было живо
     phrases = [
         "Анализирую вопрос",
         "Ищу информацию",
@@ -127,10 +138,8 @@ def update_timer(chat_id, message_id, stop_event):
     phrase_index = 0
 
     while not stop_event.is_set():
-        # Рандомная пауза от 2 до 5 секунд
         wait_time = random.uniform(2.0, 5.0)
 
-        # Ждём рандомное время, но проверяем stop_event каждые 0.3 сек
         waited = 0
         while waited < wait_time:
             if stop_event.is_set():
@@ -138,25 +147,19 @@ def update_timer(chat_id, message_id, stop_event):
             time.sleep(0.3)
             waited += 0.3
 
-        # Если Dify уже ответил — выходим
         if stop_event.is_set():
             return
 
-        # Прибавляем реально прошедшее время (округляем)
         total_seconds += int(round(wait_time))
 
-        # Выбираем фразу (по кругу)
         phrase = phrases[phrase_index % len(phrases)]
         phrase_index += 1
 
-        # Выбираем кадр анимации
         frame = frames[frame_index % 2]
         frame_index += 1
 
-        # Собираем текст
         timer_text = f"{frame} {phrase}... ({total_seconds} сек)"
 
-        # Обновляем сообщение
         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
         tg_data = {
             "chat_id": chat_id,
@@ -169,7 +172,6 @@ def update_timer(chat_id, message_id, stop_event):
         except Exception:
             pass
 
-        # Обновляем статус "печатает..."
         send_typing_action(chat_id)
 
 
@@ -231,9 +233,12 @@ def process_message(user_text, chat_id, client_id):
     if not placeholder_id:
         answer = ask_dify(user_text, chat_id, client_id)
         send_telegram_message(chat_id, answer)
+        # Снимаем блокировку
+        with spam_lock:
+            processing[str(chat_id)] = False
         return
 
-    # ШАГ 2: Запускаем таймер
+    # ШАГ 2: Таймер
     stop_event = threading.Event()
     timer_thread = threading.Thread(
         target=update_timer,
@@ -242,7 +247,7 @@ def process_message(user_text, chat_id, client_id):
     timer_thread.start()
     print(f"[TIMER STARTED]")
 
-    # ШАГ 3: Запрос в Dify (таймер тикает пока ждём)
+    # ШАГ 3: Запрос в Dify
     answer = ask_dify(user_text, chat_id, client_id)
 
     # ШАГ 4: Останавливаем таймер
@@ -256,9 +261,15 @@ def process_message(user_text, chat_id, client_id):
     edit_telegram_message(chat_id, placeholder_id, answer)
     print(f"[DONE] Ответ отправлен")
 
+    # ====== ШАГ 6 (НОВОЕ): Снимаем блокировку ======
+    # Теперь юзер может отправить следующее сообщение
+    with spam_lock:
+        processing[str(chat_id)] = False
+        print(f"[UNLOCK] chat_id={chat_id} разблокирован")
+
 
 # =============================================
-# Эндпоинты
+# ЭНДПОИНТ /ask С ЗАЩИТОЙ ОТ СПАМА
 # =============================================
 @app.route("/ask", methods=["POST"])
 def ask():
@@ -267,20 +278,51 @@ def ask():
     user_text = data.get("question", "")
     chat_id = data.get("chat_id", "")
     client_id = data.get("client_id", "user")
+
     if not user_text or not chat_id:
         print(f"[SKIP] empty question or chat_id")
         return json.dumps({"status": "error"})
+
+    chat_id_str = str(chat_id)
+    current_time = time.time()
+
+    with spam_lock:
+        # ====== ПРОВЕРКА 1: Юзер уже в обработке? ======
+        if processing.get(chat_id_str, False):
+            print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается, игнорируем")
+            # Отправляем мягкое предупреждение
+            send_telegram_message(chat_id, "✋ Подожди, я ещё думаю над прошлым вопросом! Отвечу и сразу возьмусь за следующий.")
+            return json.dumps({"status": "busy"})
+
+        # ====== ПРОВЕРКА 2: Слишком быстро шлёт? ======
+        last_time = last_message_time.get(chat_id_str, 0)
+        if current_time - last_time < MIN_DELAY:
+            print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро, игнорируем")
+            return json.dumps({"status": "too_fast"})
+
+        # ====== Всё ок — помечаем как "в обработке" ======
+        processing[chat_id_str] = True
+        last_message_time[chat_id_str] = current_time
+        print(f"[LOCK] chat_id={chat_id} заблокирован для обработки")
+
+    # Запускаем обработку
     t = threading.Thread(target=process_message, args=(user_text, chat_id, client_id))
     t.start()
     return json.dumps({"status": "ok"})
 
 
+# =============================================
+# Остальные эндпоинты
+# =============================================
 @app.route("/reset", methods=["POST"])
 def reset():
     data = request.json
     chat_id = str(data.get("chat_id", ""))
     if chat_id in conversations:
         del conversations[chat_id]
+    # Также сбрасываем блокировку при ресете
+    with spam_lock:
+        processing[chat_id] = False
     return json.dumps({"status": "reset"})
 
 
