@@ -379,4 +379,128 @@ def ask_dify(user_text, chat_id, client_id):
 
     except requests.exceptions.Timeout:
         print("[DIFY TIMEOUT]")
-        return "Ой, я слишком долго думал и завис. Попроб
+        return "Ой, я слишком долго думал и завис. Попробуй ещё раз!"
+
+    except Exception as e:
+        print(f"[DIFY ERROR] {str(e)}")
+        return "Упс, что-то пошло не так. Попробуй написать ещё раз!"
+
+
+# =============================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# =============================================
+def process_message(user_text, chat_id, client_id):
+
+    # ШАГ 1: Заглушка
+    placeholder_id = send_telegram_message(chat_id, "⏳ Анализирую вопрос...")
+    print(f"[PLACEHOLDER] message_id={placeholder_id}")
+
+    if not placeholder_id:
+        answer = ask_dify(user_text, chat_id, client_id)
+        send_telegram_message(chat_id, answer)
+        with spam_lock:
+            processing[str(chat_id)] = False
+        return
+
+    # ШАГ 2: Таймер
+    stop_event = threading.Event()
+    timer_thread = threading.Thread(
+        target=update_timer,
+        args=(chat_id, placeholder_id, stop_event)
+    )
+    timer_thread.start()
+    print(f"[TIMER STARTED]")
+
+    # ШАГ 3: Запрос в Dify
+    answer = ask_dify(user_text, chat_id, client_id)
+
+    # ШАГ 4: Останавливаем таймер
+    stop_event.set()
+    timer_thread.join(timeout=5)
+    print(f"[TIMER STOPPED]")
+
+    time.sleep(0.3)
+
+    # ШАГ 5: Заменяем заглушку на ответ
+    edit_telegram_message(chat_id, placeholder_id, answer)
+    print(f"[DONE] Ответ отправлен")
+
+    # ШАГ 6: Снимаем блокировку
+    with spam_lock:
+        processing[str(chat_id)] = False
+        print(f"[UNLOCK] chat_id={chat_id} разблокирован")
+
+
+# =============================================
+# ЭНДПОИНТ /ask С ЗАЩИТОЙ ОТ СПАМА + ПРОВЕРКА ВОЗРАСТА
+# =============================================
+@app.route("/ask", methods=["POST"])
+def ask():
+    data = request.json
+    print(f"[RECEIVED] {data}")
+    user_text = data.get("question", "")
+    chat_id = data.get("chat_id", "")
+    client_id = data.get("client_id", "user")
+
+    if not user_text or not chat_id:
+        print(f"[SKIP] empty question or chat_id")
+        return json.dumps({"status": "error"})
+
+    chat_id_str = str(chat_id)
+    current_time = time.time()
+
+    # ====== ПРОВЕРКА ВОЗРАСТА СООБЩЕНИЯ ======
+    message_timestamp = data.get("timestamp", None)
+
+    if message_timestamp:
+        try:
+            message_timestamp = float(message_timestamp)
+            message_age = current_time - message_timestamp
+            if message_age > MAX_MESSAGE_AGE:
+                print(f"[OLD MESSAGE] chat_id={chat_id}, возраст={message_age:.0f} сек, ИГНОР")
+                return json.dumps({"status": "too_old"})
+        except (ValueError, TypeError):
+            pass
+
+    with spam_lock:
+        # ПРОВЕРКА 1: Юзер уже в обработке?
+        if processing.get(chat_id_str, False):
+            print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается")
+            send_telegram_message(chat_id, "✋ Подожди, я ещё думаю над прошлым вопросом! Отвечу и сразу возьмусь за следующий.")
+            return json.dumps({"status": "busy"})
+
+        # ПРОВЕРКА 2: Слишком быстро шлёт?
+        last_time = last_message_time.get(chat_id_str, 0)
+        if current_time - last_time < MIN_DELAY:
+            print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро")
+            return json.dumps({"status": "too_fast"})
+
+        # Всё ок — блокируем
+        processing[chat_id_str] = True
+        last_message_time[chat_id_str] = current_time
+
+    t = threading.Thread(target=process_message, args=(user_text, chat_id, client_id))
+    t.start()
+    return json.dumps({"status": "ok"})
+
+
+# =============================================
+# /reset (ТЕПЕРЬ С SQLite)
+# =============================================
+@app.route("/reset", methods=["POST"])
+def reset():
+    data = request.json
+    chat_id = str(data.get("chat_id", ""))
+    delete_conversation_id(chat_id)
+    with spam_lock:
+        processing[chat_id] = False
+    return json.dumps({"status": "reset"})
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot server is running!"
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
