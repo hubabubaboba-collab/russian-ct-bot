@@ -13,24 +13,12 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY")
 
-# =============================================
-# ЗАЩИТА ОТ СПАМА (в оперативке — это ок)
-# =============================================
 last_message_time = {}
 processing = {}
 MIN_DELAY = 2
 spam_lock = threading.Lock()
-
-# =============================================
-# Максимальный возраст сообщения (в секундах)
-# Если сообщение старше — игнорируем
-# =============================================
 MAX_MESSAGE_AGE = 60
 
-
-# =============================================
-# SQLite: БАЗА ДАННЫХ ДЛЯ CONVERSATION_ID
-# =============================================
 DB_PATH = "/opt/render/project/data/bot.db"
 
 def init_db():
@@ -115,20 +103,33 @@ init_db()
 
 
 # =============================================
-# Очистка текста от двойных пробелов DeepSeek
-# (они ломают Telegram Markdown парсер)
+# КОНВЕРТЕР Markdown → HTML для Telegram
 # =============================================
-def clean_markdown_text(text):
+def markdown_to_html(text):
+    # Убираем двойные пробелы DeepSeek
     text = re.sub(r'  +\n', '\n', text)
     text = re.sub(r'  +$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    # Убираем # заголовки
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Экранируем HTML-спецсимволы (кроме наших тегов)
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    # Конвертируем *** (жирный курсив) → <b><i>текст</i></b>
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', text)
+    # Конвертируем ** (жирный) → <b>текст</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # Конвертируем * (курсив) → <i>текст</i>
+    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
+    # Убираем оставшиеся одиночные звёздочки (непарные)
+    text = text.replace('*', '')
     return text
 
 
 # =============================================
-# Полная очистка Markdown для fallback
+# Убрать всё форматирование (для fallback)
 # =============================================
-def strip_markdown(text):
+def strip_all_formatting(text):
     text = re.sub(r'```[\s\S]*?```', '', text)
     text = re.sub(r'`(.+?)`', r'\1', text)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
@@ -143,24 +144,23 @@ def strip_markdown(text):
 
 
 # =============================================
-# Отправка сообщения с Markdown + fallback
+# Отправка сообщения: HTML + fallback на plain
 # =============================================
 def send_telegram_message(chat_id, text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    clean_md = clean_markdown_text(text)
-
-    tg_data = {"chat_id": chat_id, "text": clean_md, "parse_mode": "Markdown"}
+    html_text = markdown_to_html(text)
+    tg_data = {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML"}
     try:
         response = requests.post(tg_url, json=tg_data, timeout=10)
         result = response.json()
         if result.get("ok"):
             message_id = result["result"]["message_id"]
-            print(f"[TG SEND] OK (Markdown), message_id={message_id}")
+            print(f"[TG SEND] OK (HTML), message_id={message_id}")
             return message_id
         else:
-            print(f"[TG SEND] Markdown failed: {result.get('description', '')}")
-            clean_text = strip_markdown(text)
+            print(f"[TG SEND] HTML failed: {result.get('description', '')}")
+            clean_text = strip_all_formatting(text)
             tg_data_plain = {"chat_id": chat_id, "text": clean_text}
             response2 = requests.post(tg_url, json=tg_data_plain, timeout=10)
             result2 = response2.json()
@@ -177,28 +177,28 @@ def send_telegram_message(chat_id, text):
 
 
 # =============================================
-# Редактирование сообщения с Markdown + fallback
+# Редактирование сообщения: HTML + fallback
 # =============================================
 def edit_telegram_message(chat_id, message_id, new_text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
 
-    clean_md = clean_markdown_text(new_text)
+    html_text = markdown_to_html(new_text)
 
-    if len(clean_md) <= 4096:
+    if len(html_text) <= 4096:
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": clean_md,
-            "parse_mode": "Markdown"
+            "text": html_text,
+            "parse_mode": "HTML"
         }
         try:
             response = requests.post(tg_url, json=tg_data, timeout=10)
             result = response.json()
             if result.get("ok"):
-                print(f"[TG EDIT] OK (Markdown)")
+                print(f"[TG EDIT] OK (HTML)")
             else:
-                print(f"[TG EDIT] Markdown failed: {result.get('description', '')}")
-                clean_text = strip_markdown(new_text)
+                print(f"[TG EDIT] HTML failed: {result.get('description', '')}")
+                clean_text = strip_all_formatting(new_text)
                 tg_data_plain = {
                     "chat_id": chat_id,
                     "message_id": message_id,
@@ -215,19 +215,18 @@ def edit_telegram_message(chat_id, message_id, new_text):
             print(f"[TG EDIT EXCEPTION] {e}")
             send_telegram_message(chat_id, new_text)
     else:
-        chunks = split_text(clean_md, 4096)
+        chunks = split_text(html_text, 4096)
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": chunks[0],
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         }
         try:
             response = requests.post(tg_url, json=tg_data, timeout=10)
             result = response.json()
             if not result.get("ok"):
-                print(f"[TG EDIT CHUNK] Markdown failed, trying plain")
-                clean_chunk = strip_markdown(chunks[0])
+                clean_chunk = strip_all_formatting(chunks[0])
                 tg_data_plain = {
                     "chat_id": chat_id,
                     "message_id": message_id,
@@ -240,11 +239,7 @@ def edit_telegram_message(chat_id, message_id, new_text):
 
         for chunk in chunks[1:]:
             send_telegram_message(chat_id, chunk)
-
-# =============================================
-# Разбивка длинного текста
-# =============================================
-def split_text(text, max_length=4096):
+            def split_text(text, max_length=4096):
     chunks = []
     while len(text) > max_length:
         split_pos = text.rfind('\n', 0, max_length)
@@ -284,7 +279,6 @@ def update_timer(chat_id, message_id, stop_event):
     frame_index = 0
     total_seconds = 0
     phrase_index = 0
-
     while not stop_event.is_set():
         wait_time = random.uniform(2.0, 5.0)
         waited = 0
