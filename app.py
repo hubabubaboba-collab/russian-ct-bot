@@ -85,6 +85,9 @@ init_db()
 
 
 def markdown_to_html(text):
+    text = text.replace('\\\\', '\x00SLASH\x00')
+    text = text.replace('\\', '')
+    text = text.replace('\x00SLASH\x00', '\\')
     text = re.sub(r'  +\n', '\n', text)
     text = re.sub(r'  +$', '', text, flags=re.MULTILINE)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
