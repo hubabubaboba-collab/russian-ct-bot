@@ -34,12 +34,10 @@ MAX_MESSAGE_AGE = 60
 DB_PATH = "/opt/render/project/data/bot.db"
 
 def init_db():
-    """Создаём таблицу если её нет"""
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     except Exception:
         pass
-
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -58,7 +56,6 @@ def init_db():
 
 
 def get_conversation_id(chat_id):
-    """Получить conversation_id из базы"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -77,7 +74,6 @@ def get_conversation_id(chat_id):
 
 
 def save_conversation_id(chat_id, conversation_id):
-    """Сохранить conversation_id в базу"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -101,7 +97,6 @@ def save_conversation_id(chat_id, conversation_id):
 
 
 def delete_conversation_id(chat_id):
-    """Удалить conversation_id из базы (при /reset)"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -116,34 +111,46 @@ def delete_conversation_id(chat_id):
         print(f"[DB ERROR] delete: {e}")
 
 
-# Инициализируем базу при старте
 init_db()
 
 
 # =============================================
-# НОВОЕ: Очистка Markdown для fallback
-# Убирает все звёздочки если Markdown сломался
+# Очистка текста от двойных пробелов DeepSeek
+# (они ломают Telegram Markdown парсер)
 # =============================================
-def strip_markdown(text):
-    """Убирает Markdown-разметку из текста"""
-    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
-    text = re.sub(r'_(.+?)_', r'\1', text)
-    text = re.sub(r'```[\s\S]*?```', '', text)
-    text = re.sub(r'`(.+?)`', r'\1', text)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+def clean_markdown_text(text):
+    text = re.sub(r'  +\n', '\n', text)
+    text = re.sub(r'  +$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
     return text
 
 
 # =============================================
-# ИЗМЕНЕНО: Отправка сообщения с Markdown + fallback
+# Полная очистка Markdown для fallback
+# =============================================
+def strip_markdown(text):
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = text.replace('***', '')
+    text = text.replace('**', '')
+    text = text.replace('*', '')
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text)
+    text = re.sub(r'  +\n', '\n', text)
+    text = re.sub(r'  +$', '', text, flags=re.MULTILINE)
+    return text
+
+
+# =============================================
+# Отправка сообщения с Markdown + fallback
 # =============================================
 def send_telegram_message(chat_id, text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    tg_data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    clean_md = clean_markdown_text(text)
+
+    tg_data = {"chat_id": chat_id, "text": clean_md, "parse_mode": "Markdown"}
     try:
         response = requests.post(tg_url, json=tg_data, timeout=10)
         result = response.json()
@@ -170,16 +177,18 @@ def send_telegram_message(chat_id, text):
 
 
 # =============================================
-# ИЗМЕНЕНО: Редактирование сообщения с Markdown + fallback
+# Редактирование сообщения с Markdown + fallback
 # =============================================
 def edit_telegram_message(chat_id, message_id, new_text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
 
-    if len(new_text) <= 4096:
+    clean_md = clean_markdown_text(new_text)
+
+    if len(clean_md) <= 4096:
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": new_text,
+            "text": clean_md,
             "parse_mode": "Markdown"
         }
         try:
@@ -206,8 +215,7 @@ def edit_telegram_message(chat_id, message_id, new_text):
             print(f"[TG EDIT EXCEPTION] {e}")
             send_telegram_message(chat_id, new_text)
     else:
-        chunks = split_text(new_text, 4096)
-
+        chunks = split_text(clean_md, 4096)
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -233,7 +241,6 @@ def edit_telegram_message(chat_id, message_id, new_text):
         for chunk in chunks[1:]:
             send_telegram_message(chat_id, chunk)
 
-
 # =============================================
 # Разбивка длинного текста
 # =============================================
@@ -252,9 +259,6 @@ def split_text(text, max_length=4096):
     return chunks
 
 
-# =============================================
-# Показать "печатает..."
-# =============================================
 def send_typing_action(chat_id):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction"
     try:
@@ -263,9 +267,6 @@ def send_typing_action(chat_id):
         pass
 
 
-# =============================================
-# Динамический таймер
-# =============================================
 def update_timer(chat_id, message_id, stop_event):
     phrases = [
         "Анализирую вопрос",
@@ -279,7 +280,6 @@ def update_timer(chat_id, message_id, stop_event):
         "Финальные штрихи",
         "Ещё чуть-чуть",
     ]
-
     frames = ["⏳", "⌛"]
     frame_index = 0
     total_seconds = 0
@@ -287,27 +287,20 @@ def update_timer(chat_id, message_id, stop_event):
 
     while not stop_event.is_set():
         wait_time = random.uniform(2.0, 5.0)
-
         waited = 0
         while waited < wait_time:
             if stop_event.is_set():
                 return
             time.sleep(0.3)
             waited += 0.3
-
         if stop_event.is_set():
             return
-
         total_seconds += int(round(wait_time))
-
         phrase = phrases[phrase_index % len(phrases)]
         phrase_index += 1
-
         frame = frames[frame_index % 2]
         frame_index += 1
-
         timer_text = f"{frame} {phrase}... ({total_seconds} сек)"
-
         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
         tg_data = {
             "chat_id": chat_id,
@@ -319,16 +312,11 @@ def update_timer(chat_id, message_id, stop_event):
             print(f"[TIMER] {timer_text}")
         except Exception:
             pass
-
         send_typing_action(chat_id)
 
 
-# =============================================
-# Запрос в Dify (ТЕПЕРЬ С SQLite)
-# =============================================
 def ask_dify(user_text, chat_id, client_id):
     conv_id = get_conversation_id(chat_id)
-
     url = "https://api.dify.ai/v1/chat-messages"
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
@@ -341,11 +329,9 @@ def ask_dify(user_text, chat_id, client_id):
         "conversation_id": conv_id,
         "user": str(client_id)
     }
-
     print(f"[SEND TO DIFY] query: {user_text}")
     print(f"[SEND TO DIFY] conv_id: {conv_id}")
     print(f"[SEND TO DIFY] user: {client_id}")
-
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=120)
         print(f"[DIFY STATUS] {response.status_code}")
@@ -353,40 +339,28 @@ def ask_dify(user_text, chat_id, client_id):
         result = response.json()
         answer = result.get("answer", "")
         new_conv_id = result.get("conversation_id", "")
-
         if new_conv_id:
             save_conversation_id(chat_id, new_conv_id)
-
         if not answer:
             answer = "Упс, мой мозг на секунду завис! Попробуй написать ещё раз"
         return answer
-
     except requests.exceptions.Timeout:
         print("[DIFY TIMEOUT]")
         return "Ой, я слишком долго думал и завис. Попробуй ещё раз!"
-
     except Exception as e:
         print(f"[DIFY ERROR] {str(e)}")
         return "Упс, что-то пошло не так. Попробуй написать ещё раз!"
 
 
-# =============================================
-# ГЛАВНАЯ ФУНКЦИЯ (с порционной отправкой + рандомная пауза)
-# =============================================
 def process_message(user_text, chat_id, client_id):
-
-    # ШАГ 1: Заглушка
     placeholder_id = send_telegram_message(chat_id, "⏳ Анализирую вопрос...")
     print(f"[PLACEHOLDER] message_id={placeholder_id}")
-
     if not placeholder_id:
         answer = ask_dify(user_text, chat_id, client_id)
         send_telegram_message(chat_id, answer)
         with spam_lock:
             processing[str(chat_id)] = False
         return
-
-    # ШАГ 2: Таймер
     stop_event = threading.Event()
     timer_thread = threading.Thread(
         target=update_timer,
@@ -394,48 +368,32 @@ def process_message(user_text, chat_id, client_id):
     )
     timer_thread.start()
     print(f"[TIMER STARTED]")
-
-    # ШАГ 3: Запрос в Dify
     answer = ask_dify(user_text, chat_id, client_id)
-
-    # ШАГ 4: Останавливаем таймер
     stop_event.set()
     timer_thread.join(timeout=5)
     print(f"[TIMER STOPPED]")
-
     time.sleep(0.3)
-
-    # ШАГ 5: Разбиваем ответ по разделителю ===SPLIT===
     parts = answer.split("===SPLIT===")
     parts = [part.strip() for part in parts if part.strip()]
-
     if len(parts) <= 1:
         edit_telegram_message(chat_id, placeholder_id, answer)
         print(f"[DONE] Ответ отправлен (одним сообщением)")
     else:
         edit_telegram_message(chat_id, placeholder_id, parts[0])
         print(f"[SPLIT] Часть 1/{len(parts)} → заглушка заменена")
-
         for i, part in enumerate(parts[1:], start=2):
-            # Рандомная пауза 7-12 сек (имитация живой печати)
             pause = random.uniform(7.0, 12.0)
             send_typing_action(chat_id)
             time.sleep(pause)
             send_typing_action(chat_id)
             send_telegram_message(chat_id, part)
             print(f"[SPLIT] Часть {i}/{len(parts)} → отправлена (пауза {pause:.1f} сек)")
-
         print(f"[DONE] Ответ отправлен ({len(parts)} частей)")
-
-    # ШАГ 6: Снимаем блокировку
     with spam_lock:
         processing[str(chat_id)] = False
         print(f"[UNLOCK] chat_id={chat_id} разблокирован")
 
 
-# =============================================
-# ЭНДПОИНТ /ask С ЗАЩИТОЙ ОТ СПАМА + ПРОВЕРКА ВОЗРАСТА
-# =============================================
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
@@ -443,16 +401,12 @@ def ask():
     user_text = data.get("question", "")
     chat_id = data.get("chat_id", "")
     client_id = data.get("client_id", "user")
-
     if not user_text or not chat_id:
         print(f"[SKIP] empty question or chat_id")
         return json.dumps({"status": "error"})
-
     chat_id_str = str(chat_id)
     current_time = time.time()
-
     message_timestamp = data.get("timestamp", None)
-
     if message_timestamp:
         try:
             message_timestamp = float(message_timestamp)
@@ -462,29 +416,22 @@ def ask():
                 return json.dumps({"status": "too_old"})
         except (ValueError, TypeError):
             pass
-
     with spam_lock:
         if processing.get(chat_id_str, False):
             print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается")
             send_telegram_message(chat_id, "✋ Подожди, я ещё думаю над прошлым вопросом! Отвечу и сразу возьмусь за следующий.")
             return json.dumps({"status": "busy"})
-
         last_time = last_message_time.get(chat_id_str, 0)
         if current_time - last_time < MIN_DELAY:
             print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро")
             return json.dumps({"status": "too_fast"})
-
         processing[chat_id_str] = True
         last_message_time[chat_id_str] = current_time
-
     t = threading.Thread(target=process_message, args=(user_text, chat_id, client_id))
     t.start()
     return json.dumps({"status": "ok"})
 
 
-# =============================================
-# /reset (ТЕПЕРЬ С SQLite)
-# =============================================
 @app.route("/reset", methods=["POST"])
 def reset():
     data = request.json
