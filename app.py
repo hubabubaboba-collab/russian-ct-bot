@@ -126,21 +126,13 @@ init_db()
 # =============================================
 def strip_markdown(text):
     """Убирает Markdown-разметку из текста"""
-    # Убираем *** (жирный курсив)
     text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
-    # Убираем ** (жирный)
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    # Убираем * (курсив)
     text = re.sub(r'\*(.+?)\*', r'\1', text)
-    # Убираем __ (подчёркивание)
     text = re.sub(r'__(.+?)__', r'\1', text)
-    # Убираем _ (курсив)
     text = re.sub(r'_(.+?)_', r'\1', text)
-    # Убираем ``` (блоки кода)
     text = re.sub(r'```[\s\S]*?```', '', text)
-    # Убираем ` (инлайн код)
     text = re.sub(r'`(.+?)`', r'\1', text)
-    # Убираем # заголовки
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
     return text
 
@@ -151,7 +143,6 @@ def strip_markdown(text):
 def send_telegram_message(chat_id, text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    # Попытка 1: отправляем с Markdown (красивый текст)
     tg_data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
         response = requests.post(tg_url, json=tg_data, timeout=10)
@@ -161,7 +152,6 @@ def send_telegram_message(chat_id, text):
             print(f"[TG SEND] OK (Markdown), message_id={message_id}")
             return message_id
         else:
-            # Markdown сломался — отправляем без форматирования
             print(f"[TG SEND] Markdown failed: {result.get('description', '')}")
             clean_text = strip_markdown(text)
             tg_data_plain = {"chat_id": chat_id, "text": clean_text}
@@ -186,7 +176,6 @@ def edit_telegram_message(chat_id, message_id, new_text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
 
     if len(new_text) <= 4096:
-        # Попытка 1: с Markdown
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -199,7 +188,6 @@ def edit_telegram_message(chat_id, message_id, new_text):
             if result.get("ok"):
                 print(f"[TG EDIT] OK (Markdown)")
             else:
-                # Markdown сломался — пробуем без него
                 print(f"[TG EDIT] Markdown failed: {result.get('description', '')}")
                 clean_text = strip_markdown(new_text)
                 tg_data_plain = {
@@ -218,10 +206,8 @@ def edit_telegram_message(chat_id, message_id, new_text):
             print(f"[TG EDIT EXCEPTION] {e}")
             send_telegram_message(chat_id, new_text)
     else:
-        # Длинный текст — разбиваем
         chunks = split_text(new_text, 4096)
 
-        # Первый кусок — редактируем заглушку
         tg_data = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -232,7 +218,6 @@ def edit_telegram_message(chat_id, message_id, new_text):
             response = requests.post(tg_url, json=tg_data, timeout=10)
             result = response.json()
             if not result.get("ok"):
-                # Markdown сломался
                 print(f"[TG EDIT CHUNK] Markdown failed, trying plain")
                 clean_chunk = strip_markdown(chunks[0])
                 tg_data_plain = {
@@ -245,7 +230,6 @@ def edit_telegram_message(chat_id, message_id, new_text):
             print(f"[TG EDIT CHUNK ERROR] {e}")
             send_telegram_message(chat_id, chunks[0])
 
-        # Остальные куски — новыми сообщениями
         for chunk in chunks[1:]:
             send_telegram_message(chat_id, chunk)
 
@@ -385,8 +369,9 @@ def ask_dify(user_text, chat_id, client_id):
         print(f"[DIFY ERROR] {str(e)}")
         return "Упс, что-то пошло не так. Попробуй написать ещё раз!"
 
+
 # =============================================
-# ГЛАВНАЯ ФУНКЦИЯ (с порционной отправкой)
+# ГЛАВНАЯ ФУНКЦИЯ (с порционной отправкой + рандомная пауза)
 # =============================================
 def process_message(user_text, chat_id, client_id):
 
@@ -422,23 +407,23 @@ def process_message(user_text, chat_id, client_id):
 
     # ШАГ 5: Разбиваем ответ по разделителю ===SPLIT===
     parts = answer.split("===SPLIT===")
-    # Убираем пустые части и лишние пробелы
     parts = [part.strip() for part in parts if part.strip()]
 
     if len(parts) <= 1:
-        # Разделителей нет — отправляем как обычно (одним сообщением)
         edit_telegram_message(chat_id, placeholder_id, answer)
         print(f"[DONE] Ответ отправлен (одним сообщением)")
     else:
-        # Есть разделители — первую часть в заглушку, остальные новыми сообщениями
         edit_telegram_message(chat_id, placeholder_id, parts[0])
         print(f"[SPLIT] Часть 1/{len(parts)} → заглушка заменена")
 
         for i, part in enumerate(parts[1:], start=2):
-            # Пауза между сообщениями (чтобы было естественно)
-            time.sleep(1.0)
+            # Рандомная пауза 7-12 сек (имитация живой печати)
+            pause = random.uniform(7.0, 12.0)
+            send_typing_action(chat_id)
+            time.sleep(pause)
+            send_typing_action(chat_id)
             send_telegram_message(chat_id, part)
-            print(f"[SPLIT] Часть {i}/{len(parts)} → отправлена")
+            print(f"[SPLIT] Часть {i}/{len(parts)} → отправлена (пауза {pause:.1f} сек)")
 
         print(f"[DONE] Ответ отправлен ({len(parts)} частей)")
 
@@ -466,7 +451,6 @@ def ask():
     chat_id_str = str(chat_id)
     current_time = time.time()
 
-    # ====== ПРОВЕРКА ВОЗРАСТА СООБЩЕНИЯ ======
     message_timestamp = data.get("timestamp", None)
 
     if message_timestamp:
@@ -480,19 +464,16 @@ def ask():
             pass
 
     with spam_lock:
-        # ПРОВЕРКА 1: Юзер уже в обработке?
         if processing.get(chat_id_str, False):
             print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается")
             send_telegram_message(chat_id, "✋ Подожди, я ещё думаю над прошлым вопросом! Отвечу и сразу возьмусь за следующий.")
             return json.dumps({"status": "busy"})
 
-        # ПРОВЕРКА 2: Слишком быстро шлёт?
         last_time = last_message_time.get(chat_id_str, 0)
         if current_time - last_time < MIN_DELAY:
             print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро")
             return json.dumps({"status": "too_fast"})
 
-        # Всё ок — блокируем
         processing[chat_id_str] = True
         last_message_time[chat_id_str] = current_time
 
