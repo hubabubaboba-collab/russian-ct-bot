@@ -28,14 +28,21 @@ def process_message(user_text, chat_id, client_id):
         "user": str(client_id)
     }
 
+    print(f"[SEND TO DIFY] query: {user_text}")
+    print(f"[SEND TO DIFY] conv_id: {conv_id}")
+    print(f"[SEND TO DIFY] user: {client_id}")
+
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=120)
+        print(f"[DIFY STATUS] {response.status_code}")
+        print(f"[DIFY RAW] {response.text[:500]}")
         result = response.json()
         answer = result.get("answer", "Нет ответа от нейросети")
         new_conv_id = result.get("conversation_id", "")
         if new_conv_id:
             conversations[str(chat_id)] = new_conv_id
     except Exception as e:
+        print(f"[ERROR] {str(e)}")
         answer = "Ошибка: " + str(e)
 
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -45,10 +52,12 @@ def process_message(user_text, chat_id, client_id):
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
+    print(f"[RECEIVED] {data}")
     user_text = data.get("question", "")
     chat_id = data.get("chat_id", "")
     client_id = data.get("client_id", "user")
     if not user_text or not chat_id:
+        print(f"[SKIP] empty question or chat_id")
         return json.dumps({"status": "error"})
     t = threading.Thread(target=process_message, args=(user_text, chat_id, client_id))
     t.start()
