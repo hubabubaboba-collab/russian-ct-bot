@@ -5,25 +5,119 @@ import json
 import os
 import time
 import random
+import sqlite3
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY")
 
-conversations = {}
+# =============================================
+# ЗАЩИТА ОТ СПАМА (в оперативке — это ок)
+# =============================================
+last_message_time = {}
+processing = {}
+MIN_DELAY = 2
+spam_lock = threading.Lock()
 
 # =============================================
-# НОВОЕ: Защита от спама
+# Максимальный возраст сообщения (в секундах)
+# Если сообщение старше — игнорируем
 # =============================================
-# Хранит время последнего сообщения каждого юзера
-last_message_time = {}
-# Хранит флаг "сейчас обрабатываю" для каждого юзера
-processing = {}
-# Минимальная пауза между сообщениями (в секундах)
-MIN_DELAY = 2
-# Лок для потокобезопасности
-spam_lock = threading.Lock()
+MAX_MESSAGE_AGE = 60
+
+
+# =============================================
+# SQLite: БАЗА ДАННЫХ ДЛЯ CONVERSATION_ID
+# =============================================
+DB_PATH = "/opt/render/project/data/bot.db"
+
+def init_db():
+    """Создаём таблицу если её нет"""
+    try:
+        # Создаём папку если не существует
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                chat_id TEXT PRIMARY KEY,
+                conversation_id TEXT,
+                updated_at REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print(f"[DB] Инициализирована: {DB_PATH}")
+    except Exception as e:
+        print(f"[DB ERROR] Не удалось создать базу: {e}")
+
+
+def get_conversation_id(chat_id):
+    """Получить conversation_id из базы"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT conversation_id FROM conversations WHERE chat_id = ?",
+            (str(chat_id),)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0]
+        return ""
+    except Exception as e:
+        print(f"[DB ERROR] get: {e}")
+        return ""
+
+
+def save_conversation_id(chat_id, conversation_id):
+    """Сохранить conversation_id в базу"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO conversations (chat_id, conversation_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id)
+            DO UPDATE SET conversation_id = ?, updated_at = ?
+        """, (
+            str(chat_id),
+            conversation_id,
+            time.time(),
+            conversation_id,
+            time.time()
+        ))
+        conn.commit()
+        conn.close()
+        print(f"[DB] Сохранён conv_id для chat_id={chat_id}")
+    except Exception as e:
+        print(f"[DB ERROR] save: {e}")
+
+
+def delete_conversation_id(chat_id):
+    """Удалить conversation_id из базы (при /reset)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM conversations WHERE chat_id = ?",
+            (str(chat_id),)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[DB] Удалён conv_id для chat_id={chat_id}")
+    except Exception as e:
+        print(f"[DB ERROR] delete: {e}")
+
+
+# Инициализируем базу при старте
+init_db()
 
 
 # =============================================
@@ -116,7 +210,7 @@ def send_typing_action(chat_id):
 
 
 # =============================================
-# Динамический таймер с рандомом и фразами
+# Динамический таймер
 # =============================================
 def update_timer(chat_id, message_id, stop_event):
     phrases = [
@@ -176,10 +270,11 @@ def update_timer(chat_id, message_id, stop_event):
 
 
 # =============================================
-# Запрос в Dify
+# Запрос в Dify (ТЕПЕРЬ С SQLite)
 # =============================================
 def ask_dify(user_text, chat_id, client_id):
-    conv_id = conversations.get(str(chat_id), "")
+    # Берём conversation_id из БАЗЫ ДАННЫХ (не из оперативки)
+    conv_id = get_conversation_id(chat_id)
 
     url = "https://api.dify.ai/v1/chat-messages"
     headers = {
@@ -205,8 +300,11 @@ def ask_dify(user_text, chat_id, client_id):
         result = response.json()
         answer = result.get("answer", "")
         new_conv_id = result.get("conversation_id", "")
+
+        # Сохраняем conversation_id в БАЗУ ДАННЫХ
         if new_conv_id:
-            conversations[str(chat_id)] = new_conv_id
+            save_conversation_id(chat_id, new_conv_id)
+
         if not answer:
             answer = "Упс, мой мозг на секунду завис! Попробуй написать ещё раз"
         return answer
@@ -224,7 +322,6 @@ def ask_dify(user_text, chat_id, client_id):
 # ГЛАВНАЯ ФУНКЦИЯ
 # =============================================
 def process_message(user_text, chat_id, client_id):
-    global conversations
 
     # ШАГ 1: Заглушка
     placeholder_id = send_telegram_message(chat_id, "⏳ Анализирую вопрос...")
@@ -233,7 +330,6 @@ def process_message(user_text, chat_id, client_id):
     if not placeholder_id:
         answer = ask_dify(user_text, chat_id, client_id)
         send_telegram_message(chat_id, answer)
-        # Снимаем блокировку
         with spam_lock:
             processing[str(chat_id)] = False
         return
@@ -261,15 +357,14 @@ def process_message(user_text, chat_id, client_id):
     edit_telegram_message(chat_id, placeholder_id, answer)
     print(f"[DONE] Ответ отправлен")
 
-    # ====== ШАГ 6 (НОВОЕ): Снимаем блокировку ======
-    # Теперь юзер может отправить следующее сообщение
+    # ШАГ 6: Снимаем блокировку
     with spam_lock:
         processing[str(chat_id)] = False
         print(f"[UNLOCK] chat_id={chat_id} разблокирован")
 
 
 # =============================================
-# ЭНДПОИНТ /ask С ЗАЩИТОЙ ОТ СПАМА
+# ЭНДПОИНТ /ask С ЗАЩИТОЙ ОТ СПАМА + ПРОВЕРКА ВОЗРАСТА
 # =============================================
 @app.route("/ask", methods=["POST"])
 def ask():
@@ -286,41 +381,54 @@ def ask():
     chat_id_str = str(chat_id)
     current_time = time.time()
 
+    # ====== ПРОВЕРКА ВОЗРАСТА СООБЩЕНИЯ ======
+    # SaleBot может прислать timestamp когда сообщение было отправлено
+    # Если нет — используем текущее время
+    message_timestamp = data.get("timestamp", None)
+
+    if message_timestamp:
+        try:
+            message_timestamp = float(message_timestamp)
+            message_age = current_time - message_timestamp
+            if message_age > MAX_MESSAGE_AGE:
+                print(f"[OLD MESSAGE] chat_id={chat_id}, возраст={message_age:.0f} сек, ИГНОР")
+                return json.dumps({"status": "too_old"})
+        except (ValueError, TypeError):
+            # Если timestamp кривой — не парится, обрабатываем
+            pass
+
     with spam_lock:
-        # ====== ПРОВЕРКА 1: Юзер уже в обработке? ======
+        # ПРОВЕРКА 1: Юзер уже в обработке?
         if processing.get(chat_id_str, False):
-            print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается, игнорируем")
-            # Отправляем мягкое предупреждение
+            print(f"[SPAM BLOCK] chat_id={chat_id} уже обрабатывается")
             send_telegram_message(chat_id, "✋ Подожди, я ещё думаю над прошлым вопросом! Отвечу и сразу возьмусь за следующий.")
             return json.dumps({"status": "busy"})
 
-        # ====== ПРОВЕРКА 2: Слишком быстро шлёт? ======
+        # ПРОВЕРКА 2: Слишком быстро шлёт?
         last_time = last_message_time.get(chat_id_str, 0)
         if current_time - last_time < MIN_DELAY:
-            print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро, игнорируем")
+            print(f"[SPAM DELAY] chat_id={chat_id} слишком быстро")
             return json.dumps({"status": "too_fast"})
 
-        # ====== Всё ок — помечаем как "в обработке" ======
+        # Всё ок — блокируем
         processing[chat_id_str] = True
         last_message_time[chat_id_str] = current_time
-        print(f"[LOCK] chat_id={chat_id} заблокирован для обработки")
 
-    # Запускаем обработку
     t = threading.Thread(target=process_message, args=(user_text, chat_id, client_id))
     t.start()
     return json.dumps({"status": "ok"})
 
 
 # =============================================
-# Остальные эндпоинты
+# /reset (ТЕПЕРЬ С SQLite)
 # =============================================
 @app.route("/reset", methods=["POST"])
 def reset():
     data = request.json
     chat_id = str(data.get("chat_id", ""))
-    if chat_id in conversations:
-        del conversations[chat_id]
-    # Также сбрасываем блокировку при ресете
+    # Удаляем из базы данных
+    delete_conversation_id(chat_id)
+    # Снимаем блокировку
     with spam_lock:
         processing[chat_id] = False
     return json.dumps({"status": "reset"})
