@@ -4,6 +4,7 @@ import threading
 import json
 import os
 import time
+import random
 
 app = Flask(__name__)
 
@@ -14,7 +15,7 @@ conversations = {}
 
 
 # =============================================
-# Отправка сообщения в Telegram (возвращает message_id)
+# Отправка сообщения в Telegram
 # =============================================
 def send_telegram_message(chat_id, text):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -35,7 +36,7 @@ def send_telegram_message(chat_id, text):
 
 
 # =============================================
-# Редактирование сообщения (с разбивкой если длинный текст)
+# Редактирование сообщения
 # =============================================
 def edit_telegram_message(chat_id, message_id, new_text):
     if len(new_text) <= 4096:
@@ -92,7 +93,7 @@ def split_text(text, max_length=4096):
 
 
 # =============================================
-# Показать "печатает..." в Telegram
+# Показать "печатает..."
 # =============================================
 def send_typing_action(chat_id):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction"
@@ -103,40 +104,59 @@ def send_typing_action(chat_id):
 
 
 # =============================================
-# НОВОЕ: Динамический таймер
-# Обновляет заглушку каждые 2 секунды пока Dify думает
+# ДИНАМИЧЕСКИЙ ТАЙМЕР С РАНДОМОМ И ФРАЗАМИ
 # =============================================
 def update_timer(chat_id, message_id, stop_event):
-    """
-    Работает в отдельном потоке.
-    Каждые 2 секунды обновляет текст заглушки: (2 сек), (4 сек), (6 сек)...
-    Останавливается когда stop_event установлен (= Dify ответил).
-    """
-    seconds = 0
-    # Чередуем песочные часы для анимации
+    # Разные фразы чтобы было живо
+    phrases = [
+        "Анализирую вопрос",
+        "Ищу информацию",
+        "Копаюсь в материалах",
+        "Подбираю лучший ответ",
+        "Формулирую мысль",
+        "Проверяю данные",
+        "Почти готово",
+        "Собираю ответ воедино",
+        "Финальные штрихи",
+        "Ещё чуть-чуть",
+    ]
+
     frames = ["⏳", "⌛"]
     frame_index = 0
+    total_seconds = 0
+    phrase_index = 0
 
     while not stop_event.is_set():
-        # Ждём 2 секунды (но проверяем stop_event каждые 0.5 сек)
-        for _ in range(4):
+        # Рандомная пауза от 2 до 5 секунд
+        wait_time = random.uniform(2.0, 5.0)
+
+        # Ждём рандомное время, но проверяем stop_event каждые 0.3 сек
+        waited = 0
+        while waited < wait_time:
             if stop_event.is_set():
                 return
-            time.sleep(0.5)
+            time.sleep(0.3)
+            waited += 0.3
 
-        seconds += 2
-
-        # Если за время ожидания Dify уже ответил — выходим
+        # Если Dify уже ответил — выходим
         if stop_event.is_set():
             return
+
+        # Прибавляем реально прошедшее время (округляем)
+        total_seconds += int(round(wait_time))
+
+        # Выбираем фразу (по кругу)
+        phrase = phrases[phrase_index % len(phrases)]
+        phrase_index += 1
 
         # Выбираем кадр анимации
         frame = frames[frame_index % 2]
         frame_index += 1
 
-        # Обновляем текст заглушки
-        timer_text = f"{frame} Думаю... ({seconds} сек)"
+        # Собираем текст
+        timer_text = f"{frame} {phrase}... ({total_seconds} сек)"
 
+        # Обновляем сообщение
         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
         tg_data = {
             "chat_id": chat_id,
@@ -147,7 +167,7 @@ def update_timer(chat_id, message_id, stop_event):
             requests.post(tg_url, json=tg_data, timeout=5)
             print(f"[TIMER] {timer_text}")
         except Exception:
-            pass  # Не критично если одно обновление не прошло
+            pass
 
         # Обновляем статус "печатает..."
         send_typing_action(chat_id)
@@ -199,22 +219,21 @@ def ask_dify(user_text, chat_id, client_id):
 
 
 # =============================================
-# ГЛАВНАЯ ФУНКЦИЯ: заглушка + таймер + замена
+# ГЛАВНАЯ ФУНКЦИЯ
 # =============================================
 def process_message(user_text, chat_id, client_id):
     global conversations
 
-    # ====== ШАГ 1: Отправляем заглушку с таймером ======
-    placeholder_id = send_telegram_message(chat_id, "⏳ Думаю... (0 сек)")
+    # ШАГ 1: Заглушка
+    placeholder_id = send_telegram_message(chat_id, "⏳ Анализирую вопрос...")
     print(f"[PLACEHOLDER] message_id={placeholder_id}")
 
     if not placeholder_id:
-        # Заглушка не отправилась — работаем без таймера
         answer = ask_dify(user_text, chat_id, client_id)
         send_telegram_message(chat_id, answer)
         return
 
-    # ====== ШАГ 2: Запускаем таймер в отдельном потоке ======
+    # ШАГ 2: Запускаем таймер
     stop_event = threading.Event()
     timer_thread = threading.Thread(
         target=update_timer,
@@ -223,25 +242,23 @@ def process_message(user_text, chat_id, client_id):
     timer_thread.start()
     print(f"[TIMER STARTED]")
 
-    # ====== ШАГ 3: Запрашиваем ответ у Dify ======
-    # Пока эта строка выполняется (5-60 сек) — таймер тикает
+    # ШАГ 3: Запрос в Dify (таймер тикает пока ждём)
     answer = ask_dify(user_text, chat_id, client_id)
 
-    # ====== ШАГ 4: Останавливаем таймер ======
-    stop_event.set()  # Говорим потоку таймера: "стоп!"
-    timer_thread.join(timeout=5)  # Ждём пока поток завершится
+    # ШАГ 4: Останавливаем таймер
+    stop_event.set()
+    timer_thread.join(timeout=5)
     print(f"[TIMER STOPPED]")
 
-    # Маленькая пауза чтобы таймер точно остановился
     time.sleep(0.3)
 
-    # ====== ШАГ 5: Заменяем заглушку на ответ ======
+    # ШАГ 5: Заменяем заглушку на ответ
     edit_telegram_message(chat_id, placeholder_id, answer)
-    print(f"[DONE] Заглушка заменена на ответ")
+    print(f"[DONE] Ответ отправлен")
 
 
 # =============================================
-# Эндпоинты (БЕЗ ИЗМЕНЕНИЙ)
+# Эндпоинты
 # =============================================
 @app.route("/ask", methods=["POST"])
 def ask():
