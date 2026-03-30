@@ -385,9 +385,8 @@ def ask_dify(user_text, chat_id, client_id):
         print(f"[DIFY ERROR] {str(e)}")
         return "Упс, что-то пошло не так. Попробуй написать ещё раз!"
 
-
 # =============================================
-# ГЛАВНАЯ ФУНКЦИЯ
+# ГЛАВНАЯ ФУНКЦИЯ (с порционной отправкой)
 # =============================================
 def process_message(user_text, chat_id, client_id):
 
@@ -421,9 +420,27 @@ def process_message(user_text, chat_id, client_id):
 
     time.sleep(0.3)
 
-    # ШАГ 5: Заменяем заглушку на ответ
-    edit_telegram_message(chat_id, placeholder_id, answer)
-    print(f"[DONE] Ответ отправлен")
+    # ШАГ 5: Разбиваем ответ по разделителю ===SPLIT===
+    parts = answer.split("===SPLIT===")
+    # Убираем пустые части и лишние пробелы
+    parts = [part.strip() for part in parts if part.strip()]
+
+    if len(parts) <= 1:
+        # Разделителей нет — отправляем как обычно (одним сообщением)
+        edit_telegram_message(chat_id, placeholder_id, answer)
+        print(f"[DONE] Ответ отправлен (одним сообщением)")
+    else:
+        # Есть разделители — первую часть в заглушку, остальные новыми сообщениями
+        edit_telegram_message(chat_id, placeholder_id, parts[0])
+        print(f"[SPLIT] Часть 1/{len(parts)} → заглушка заменена")
+
+        for i, part in enumerate(parts[1:], start=2):
+            # Пауза между сообщениями (чтобы было естественно)
+            time.sleep(1.0)
+            send_telegram_message(chat_id, part)
+            print(f"[SPLIT] Часть {i}/{len(parts)} → отправлена")
+
+        print(f"[DONE] Ответ отправлен ({len(parts)} частей)")
 
     # ШАГ 6: Снимаем блокировку
     with spam_lock:
